@@ -47,6 +47,7 @@ SAVE_FILETYPES = [
     ("GIF", "*.gif"),
 ]
 ALPHA_LESS_EXT = {".jpg", ".jpeg", ".jfif", ".bmp"}
+SUPPORTED_EXTS = [".jpg", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".gif"]
 
 FONT_FILES = {
     "Arial": "arial.ttf",
@@ -147,6 +148,50 @@ def apply_adjustments(base_rgba, brightness, contrast, saturation, hue, sharpnes
         rgb = rgb.filter(ImageFilter.GaussianBlur(radius=blur))
     r2, g2, b2 = rgb.split()
     return Image.merge("RGBA", (r2, g2, b2, a))
+
+
+def register_file_associations():
+    """Best-effort registration of this app in Windows' per-user 'Open with'
+    list for supported image types (HKCU only -- no admin rights needed).
+    Windows protects the default-app choice (the "UserChoice" mechanism), so
+    no app is allowed to silently make itself the default. This makes Image
+    Redactor show up in the 'Open with' picker; the user still confirms
+    'Always use this app' once themselves. Returns (ok: bool, message: str).
+    """
+    if os.name != "nt":
+        return False, "This only works on Windows."
+    if not getattr(sys, "frozen", False):
+        return False, ("Build and run the packaged ImageRedactor.exe first -- "
+                        "this registers the compiled app, not the Python script.")
+    import winreg
+    exe_path = sys.executable
+    app_name = "ImageRedactor.exe"
+    app_key = rf"Software\Classes\Applications\{app_name}"
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key) as k:
+            winreg.SetValueEx(k, "FriendlyAppName", 0, winreg.REG_SZ, APP_TITLE)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key + r"\shell\open\command") as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, f'"{exe_path}" "%1"')
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, app_key + r"\SupportedTypes") as k:
+            for ext in SUPPORTED_EXTS:
+                winreg.SetValueEx(k, ext, 0, winreg.REG_SZ, "")
+        for ext in SUPPORTED_EXTS:
+            try:
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER,
+                        rf"Software\Classes\{ext}\OpenWithProgids") as k:
+                    winreg.SetValueEx(k, app_name, 0, winreg.REG_NONE, b"")
+            except Exception:
+                pass
+        return True, (
+            "Image Redactor is now listed in Windows' \"Open with\" menu.\n\n"
+            "To make it the default: right-click an image file > Open with > "
+            "Choose another app > select Image Redactor > check "
+            "\"Always use this app\" > OK.\n\n"
+            "(Windows requires that last confirmation from you directly -- "
+            "no app is allowed to set itself as default silently.)"
+        )
+    except Exception as e:
+        return False, str(e)
 
 
 class Overlay:
@@ -415,6 +460,8 @@ class ImageRedactorApp(tk.Tk):
         filem.add_separator()
         filem.add_command(label="Save", command=self.save, accelerator="Ctrl+S")
         filem.add_command(label="Save As...", command=lambda: self.save(save_as=True), accelerator="Ctrl+Shift+S")
+        filem.add_separator()
+        filem.add_command(label="Set as Default Image Viewer...", command=self.register_as_default)
         filem.add_separator()
         filem.add_command(label="Exit", command=self.on_close)
         m.add_cascade(label="File", menu=filem)
@@ -1245,6 +1292,13 @@ class ImageRedactorApp(tk.Tk):
         star = "*" if self.dirty else ""
         self.title(f"{name}{star} - {APP_TITLE}")
 
+    def register_as_default(self):
+        ok, msg = register_file_associations()
+        if ok:
+            messagebox.showinfo("Set as Default Image Viewer", msg)
+        else:
+            messagebox.showerror("Set as Default Image Viewer", msg)
+
     def show_about(self):
         messagebox.showinfo("About", f"{APP_TITLE}\n\nA simple, light image viewer/editor.\n"
                                       "Built with Python, Tkinter and Pillow.")
@@ -1263,6 +1317,12 @@ class ImageRedactorApp(tk.Tk):
 
 def main():
     app = ImageRedactorApp()
+    # Launched via double-click / "Open with" on an image file: Windows
+    # passes the file path as a command-line argument.
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+        if os.path.isfile(path):
+            app.after(50, lambda: app.open_path(path))
     app.mainloop()
 
 
