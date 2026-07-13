@@ -7,9 +7,9 @@ Features:
 - Open & save: JPG/JPEG/JFIF, PNG, WEBP, BMP, GIF (first frame)
 - Paste images or text from the clipboard
 - Undo / redo
-- Text tool (separate, movable/editable layer): font, size, color
+- Text tool (separate, movable/editable/resizable layer): font, size, color
 - Pen tool: adjustable thickness & color
-- Eraser tool: adjustable thickness (erases to transparency)
+- Eraser tool: erases only pen/text/pasted additions, never the original photo
 - Crop, flip (H/V), rotate (90 deg left/right)
 - Adjustments: brightness, contrast, saturation, hue, sharpness, blur
 
@@ -19,9 +19,8 @@ Packaged to a Windows .exe with PyInstaller - see build.bat / README.
 
 import os
 import sys
-import copy
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, colorchooser, simpledialog
+from tkinter import ttk, filedialog, messagebox, colorchooser
 
 from PIL import (
     Image, ImageDraw, ImageTk, ImageEnhance, ImageFilter,
@@ -63,6 +62,38 @@ FONT_FILES = {
     "Calibri": "calibri.ttf",
 }
 FONT_NAMES = list(FONT_FILES.keys())
+
+# ----------------------------------------------------------------- theme
+COLORS = {
+    "bg": "#1e1f22",
+    "panel": "#26272b",
+    "border": "#34353a",
+    "text": "#e6e6e6",
+    "text_dim": "#a8a9ac",
+    "accent": "#4f8cff",
+    "accent_dark": "#3b6fd1",
+    "btn": "#2f3136",
+    "btn_hover": "#3a3c42",
+    "canvas_bg": "#151619",
+}
+
+ICONS = {
+    "open": "\U0001F4C2",     # folder
+    "paste": "\U0001F4CB",    # clipboard
+    "save": "\U0001F4BE",     # floppy disk
+    "undo": "↶",
+    "redo": "↷",
+    "select": "↖",
+    "pen": "✏",
+    "eraser": "⌫",
+    "text": "T",
+    "crop": "⛶",
+    "fliph": "⇋",
+    "flipv": "⇵",
+    "rotatel": "↺",
+    "rotater": "↻",
+    "adjust": "⚙",
+}
 
 
 def get_font(family, size):
@@ -119,9 +150,11 @@ def apply_adjustments(base_rgba, brightness, contrast, saturation, hue, sharpnes
 
 
 class Overlay:
-    """A movable, editable object floating above the base raster image:
-    either a text object or a pasted image. Overlays live independently
-    until they are 'committed' (baked/flattened) into the base image."""
+    """A movable, editable, resizable object floating above the annotation
+    layer: either a text object or a pasted image. Overlays live independently
+    until they are 'committed' (baked/flattened) into the annotation layer --
+    the layer the eraser is allowed to touch. The original photo (base image)
+    is never touched by the eraser."""
 
     _next_id = 1
 
@@ -160,11 +193,47 @@ class Overlay:
             return (self.x, self.y, self.x + w, self.y + h)
 
 
+class Tooltip:
+    """Small hover tooltip for a widget (used on the icon toolbar)."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self.show, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def show(self, event=None):
+        if self.tip or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 6
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except Exception:
+            return
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        try:
+            self.tip.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, background=COLORS["panel"], foreground=COLORS["text"],
+                 relief="solid", borderwidth=1, font=("Segoe UI", 9), padx=6, pady=3).pack()
+
+    def hide(self, event=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
 class TextDialog(tk.Toplevel):
     """Modal dialog to add/edit a text overlay."""
 
     def __init__(self, master, overlay=None):
         super().__init__(master)
+        self.configure(bg=COLORS["panel"])
         self.title("Edit Text" if overlay else "Add Text")
         self.resizable(False, False)
         self.result = None
@@ -174,11 +243,13 @@ class TextDialog(tk.Toplevel):
         is_edit = overlay is not None
         self.color = overlay.color if is_edit else "#ff0000"
 
-        frm = ttk.Frame(self, padding=10)
+        frm = ttk.Frame(self, padding=12)
         frm.grid(row=0, column=0)
 
         ttk.Label(frm, text="Text:").grid(row=0, column=0, sticky="nw", pady=4)
-        self.text_widget = tk.Text(frm, width=32, height=4)
+        self.text_widget = tk.Text(frm, width=32, height=4, bg=COLORS["btn"], fg=COLORS["text"],
+                                    insertbackground=COLORS["text"], relief="flat",
+                                    highlightthickness=1, highlightbackground=COLORS["border"])
         self.text_widget.grid(row=0, column=1, columnspan=2, pady=4)
         if is_edit:
             self.text_widget.insert("1.0", overlay.text)
@@ -195,7 +266,8 @@ class TextDialog(tk.Toplevel):
         size_spin.grid(row=2, column=1, sticky="w", pady=4)
 
         ttk.Label(frm, text="Color:").grid(row=3, column=0, sticky="w", pady=4)
-        self.color_btn = tk.Button(frm, text="        ", bg=self.color,
+        self.color_btn = tk.Button(frm, text="        ", bg=self.color, relief="flat",
+                                    highlightthickness=1, highlightbackground=COLORS["border"],
                                     command=self.pick_color)
         self.color_btn.grid(row=3, column=1, sticky="w", pady=4)
 
@@ -239,12 +311,21 @@ class ImageRedactorApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1150x760")
-        self.minsize(700, 480)
+        self.geometry("1200x780")
+        self.minsize(760, 500)
+
+        self._setup_style()
 
         # --- document state ---
-        self.image = None            # PIL.Image RGBA, the base raster
-        self.overlays = []           # list[Overlay]
+        # base_image: the original photo. Adjustments/crop/flip/rotate apply
+        # here. Never touched by the eraser.
+        self.base_image = None
+        # annotation_layer: transparent layer the same size as base_image.
+        # Pen strokes live here, and text/pasted-image overlays are baked
+        # into it once committed. The eraser only erases pixels on this
+        # layer, so the original photo is always safe.
+        self.annotation_layer = None
+        self.overlays = []           # list[Overlay] -- still-editable, uncommitted
         self.selected_overlay = None
         self.current_path = None
         self.dirty = False
@@ -268,6 +349,9 @@ class ImageRedactorApp(tk.Tk):
         self._last_point = None
         self._drag_overlay = None
         self._drag_offset = None
+        self._resizing_overlay = None
+        self._resize_orig = None
+        self._handle_canvas_rect = None
         self._crop_start = None
         self._crop_rect = None  # (x0,y0,x1,y1) in image coords
         self._crop_canvas_id = None
@@ -284,12 +368,47 @@ class ImageRedactorApp(tk.Tk):
         self.update_title()
         self.set_tool("select")
 
+    # ------------------------------------------------------------- style
+    def _setup_style(self):
+        self.configure(bg=COLORS["bg"])
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure("TFrame", background=COLORS["panel"])
+        style.configure("TLabel", background=COLORS["panel"], foreground=COLORS["text"],
+                         font=("Segoe UI", 10))
+        style.configure("TButton", background=COLORS["btn"], foreground=COLORS["text"],
+                         borderwidth=0, padding=6, font=("Segoe UI", 10))
+        style.map("TButton", background=[("active", COLORS["btn_hover"]), ("pressed", COLORS["accent"])])
+
+        style.configure("Toolbar.TButton", background=COLORS["btn"], foreground=COLORS["text"],
+                         borderwidth=0, padding=(10, 8), font=("Segoe UI", 14))
+        style.map("Toolbar.TButton", background=[("active", COLORS["btn_hover"])])
+
+        style.configure("ToolbarSelected.TButton", background=COLORS["accent"], foreground="white",
+                         borderwidth=0, padding=(10, 8), font=("Segoe UI", 14))
+        style.map("ToolbarSelected.TButton", background=[("active", COLORS["accent_dark"])])
+
+        style.configure("TSeparator", background=COLORS["border"])
+        style.configure("TScale", background=COLORS["panel"], troughcolor=COLORS["btn"])
+        style.configure("TCombobox", fieldbackground=COLORS["btn"], background=COLORS["btn"],
+                         foreground=COLORS["text"])
+        style.configure("TSpinbox", fieldbackground=COLORS["btn"], foreground=COLORS["text"],
+                         background=COLORS["btn"])
+
+    def _menu_kwargs(self):
+        return dict(bg=COLORS["btn"], fg=COLORS["text"], activebackground=COLORS["accent"],
+                    activeforeground="white", bd=0, relief="flat", tearoff=0)
+
     # ------------------------------------------------------------------ UI
     def _build_menu(self):
-        m = tk.Menu(self)
+        m = tk.Menu(self, **self._menu_kwargs())
         self.config(menu=m)
 
-        filem = tk.Menu(m, tearoff=0)
+        filem = tk.Menu(m, **self._menu_kwargs())
         filem.add_command(label="New...", command=self.new_document, accelerator="Ctrl+N")
         filem.add_command(label="Open...", command=self.open_file, accelerator="Ctrl+O")
         filem.add_command(label="Paste as New/Overlay", command=self.paste_from_clipboard, accelerator="Ctrl+V")
@@ -300,14 +419,14 @@ class ImageRedactorApp(tk.Tk):
         filem.add_command(label="Exit", command=self.on_close)
         m.add_cascade(label="File", menu=filem)
 
-        editm = tk.Menu(m, tearoff=0)
+        editm = tk.Menu(m, **self._menu_kwargs())
         editm.add_command(label="Undo", command=self.undo, accelerator="Ctrl+Z")
         editm.add_command(label="Redo", command=self.redo, accelerator="Ctrl+Y")
         editm.add_separator()
         editm.add_command(label="Delete Selected Overlay", command=self.delete_selected_overlay, accelerator="Del")
         m.add_cascade(label="Edit", menu=editm)
 
-        imgm = tk.Menu(m, tearoff=0)
+        imgm = tk.Menu(m, **self._menu_kwargs())
         imgm.add_command(label="Crop", command=lambda: self.set_tool("crop"))
         imgm.add_command(label="Flip Horizontal", command=self.flip_horizontal)
         imgm.add_command(label="Flip Vertical", command=self.flip_vertical)
@@ -317,7 +436,7 @@ class ImageRedactorApp(tk.Tk):
         imgm.add_command(label="Adjustments...", command=self.open_adjust_panel)
         m.add_cascade(label="Image", menu=imgm)
 
-        toolsm = tk.Menu(m, tearoff=0)
+        toolsm = tk.Menu(m, **self._menu_kwargs())
         toolsm.add_radiobutton(label="Select / Move", variable=self.tool, value="select",
                                 command=lambda: self.set_tool("select"))
         toolsm.add_radiobutton(label="Pen", variable=self.tool, value="pen",
@@ -328,52 +447,59 @@ class ImageRedactorApp(tk.Tk):
                                 command=lambda: self.set_tool("text"))
         m.add_cascade(label="Tools", menu=toolsm)
 
-        helpm = tk.Menu(m, tearoff=0)
+        helpm = tk.Menu(m, **self._menu_kwargs())
         helpm.add_command(label="About", command=self.show_about)
         m.add_cascade(label="Help", menu=helpm)
 
+    def _icon_btn(self, bar, icon_key, tooltip, cmd, toolval=None):
+        b = ttk.Button(bar, text=ICONS[icon_key], width=3, style="Toolbar.TButton", command=cmd)
+        b.pack(side="left", padx=2, pady=4)
+        Tooltip(b, tooltip)
+        if toolval:
+            self.tool_buttons[toolval] = b
+        return b
+
     def _build_toolbar(self):
-        bar = ttk.Frame(self, padding=(4, 4))
+        bar = tk.Frame(self, bg=COLORS["panel"], highlightthickness=0)
         bar.pack(side="top", fill="x")
-
-        def btn(text, cmd, **kw):
-            b = ttk.Button(bar, text=text, command=cmd)
-            b.pack(side="left", padx=2)
-            return b
-
-        btn("Open", self.open_file)
-        btn("Paste", self.paste_from_clipboard)
-        btn("Save", self.save)
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
-        btn("Undo", self.undo)
-        btn("Redo", self.redo)
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
+        inner = ttk.Frame(bar)
+        inner.pack(side="left", padx=4, pady=2)
 
         self.tool_buttons = {}
-        for label, val in (("Select", "select"), ("Pen", "pen"), ("Eraser", "eraser"), ("Text", "text")):
-            b = ttk.Button(bar, text=label, command=lambda v=val: self.set_tool(v))
-            b.pack(side="left", padx=2)
-            self.tool_buttons[val] = b
 
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=6)
-        btn("Crop", lambda: self.set_tool("crop"))
-        btn("Flip H", self.flip_horizontal)
-        btn("Flip V", self.flip_vertical)
-        btn("Rotate L", self.rotate_left)
-        btn("Rotate R", self.rotate_right)
-        btn("Adjustments", self.open_adjust_panel)
+        self._icon_btn(inner, "open", "Open (Ctrl+O)", self.open_file)
+        self._icon_btn(inner, "paste", "Paste (Ctrl+V)", self.paste_from_clipboard)
+        self._icon_btn(inner, "save", "Save (Ctrl+S)", self.save)
+        ttk.Separator(inner, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
+        self._icon_btn(inner, "undo", "Undo (Ctrl+Z)", self.undo)
+        self._icon_btn(inner, "redo", "Redo (Ctrl+Y)", self.redo)
+        ttk.Separator(inner, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
+
+        self._icon_btn(inner, "select", "Select / Move", lambda: self.set_tool("select"), toolval="select")
+        self._icon_btn(inner, "pen", "Pen tool", lambda: self.set_tool("pen"), toolval="pen")
+        self._icon_btn(inner, "eraser", "Eraser (erases only pen/text/pasted additions)",
+                        lambda: self.set_tool("eraser"), toolval="eraser")
+        self._icon_btn(inner, "text", "Text tool", lambda: self.set_tool("text"), toolval="text")
+
+        ttk.Separator(inner, orient="vertical").pack(side="left", fill="y", padx=6, pady=4)
+        self._icon_btn(inner, "crop", "Crop", lambda: self.set_tool("crop"), toolval="crop")
+        self._icon_btn(inner, "fliph", "Flip Horizontal", self.flip_horizontal)
+        self._icon_btn(inner, "flipv", "Flip Vertical", self.flip_vertical)
+        self._icon_btn(inner, "rotatel", "Rotate Left 90°", self.rotate_left)
+        self._icon_btn(inner, "rotater", "Rotate Right 90°", self.rotate_right)
+        self._icon_btn(inner, "adjust", "Adjustments (brightness, contrast, ...)", self.open_adjust_panel)
 
     def _build_body(self):
-        body = ttk.Frame(self)
+        body = tk.Frame(self, bg=COLORS["bg"])
         body.pack(side="top", fill="both", expand=True)
 
-        self.side_panel = ttk.Frame(body, padding=8, width=250)
+        self.side_panel = ttk.Frame(body, padding=10, width=250)
         self.side_panel.pack(side="left", fill="y")
         self.side_panel.pack_propagate(False)
 
-        canvas_frame = ttk.Frame(body)
-        canvas_frame.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(canvas_frame, bg="#2b2b2b", highlightthickness=0)
+        canvas_frame = tk.Frame(body, bg=COLORS["bg"])
+        canvas_frame.pack(side="left", fill="both", expand=True, padx=(1, 0))
+        self.canvas = tk.Canvas(canvas_frame, bg=COLORS["canvas_bg"], highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
         self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
@@ -385,9 +511,9 @@ class ImageRedactorApp(tk.Tk):
 
     def _build_statusbar(self):
         self.status = tk.StringVar(value="Open an image to get started (File > Open, or Ctrl+V to paste).")
-        bar = ttk.Frame(self)
+        bar = tk.Frame(self, bg=COLORS["panel"])
         bar.pack(side="bottom", fill="x")
-        ttk.Label(bar, textvariable=self.status, anchor="w").pack(side="left", padx=6, pady=2, fill="x", expand=True)
+        ttk.Label(bar, textvariable=self.status, anchor="w").pack(side="left", padx=8, pady=4, fill="x", expand=True)
 
     def _bind_shortcuts(self):
         self.bind_all("<Control-o>", lambda e: self.open_file())
@@ -404,16 +530,19 @@ class ImageRedactorApp(tk.Tk):
     # ------------------------------------------------------------ doc / io
     def new_document(self):
         dlg = tk.Toplevel(self)
+        dlg.configure(bg=COLORS["panel"])
         dlg.title("New Image")
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
-        ttk.Label(dlg, text="Width:").grid(row=0, column=0, padx=8, pady=8, sticky="e")
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack()
+        ttk.Label(frm, text="Width:").grid(row=0, column=0, padx=8, pady=8, sticky="e")
         w_var = tk.IntVar(value=800)
-        ttk.Entry(dlg, textvariable=w_var, width=8).grid(row=0, column=1, padx=8, pady=8)
-        ttk.Label(dlg, text="Height:").grid(row=1, column=0, padx=8, pady=8, sticky="e")
+        ttk.Entry(frm, textvariable=w_var, width=8).grid(row=0, column=1, padx=8, pady=8)
+        ttk.Label(frm, text="Height:").grid(row=1, column=0, padx=8, pady=8, sticky="e")
         h_var = tk.IntVar(value=600)
-        ttk.Entry(dlg, textvariable=h_var, width=8).grid(row=1, column=1, padx=8, pady=8)
+        ttk.Entry(frm, textvariable=h_var, width=8).grid(row=1, column=1, padx=8, pady=8)
 
         def create():
             try:
@@ -427,7 +556,7 @@ class ImageRedactorApp(tk.Tk):
             self.new_document_from_image(img, None)
             dlg.destroy()
 
-        ttk.Button(dlg, text="Create", command=create).grid(row=2, column=0, columnspan=2, pady=8)
+        ttk.Button(frm, text="Create", command=create).grid(row=2, column=0, columnspan=2, pady=8)
         dlg.wait_window(dlg)
 
     def open_file(self):
@@ -446,7 +575,8 @@ class ImageRedactorApp(tk.Tk):
         self.new_document_from_image(img, path)
 
     def new_document_from_image(self, img, path):
-        self.image = img
+        self.base_image = img
+        self.annotation_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
         self.overlays = []
         self.selected_overlay = None
         self.undo_stack = []
@@ -459,7 +589,7 @@ class ImageRedactorApp(tk.Tk):
         self.update_title()
 
     def save(self, save_as=False):
-        if self.image is None:
+        if self.base_image is None:
             messagebox.showinfo("Save", "Nothing to save yet.")
             return
         self.commit_overlays(push_history=True)
@@ -472,7 +602,7 @@ class ImageRedactorApp(tk.Tk):
             if not path:
                 return
         ext = os.path.splitext(path)[1].lower()
-        out = self.image
+        out = Image.alpha_composite(self.base_image, self.annotation_layer)
         if ext in ALPHA_LESS_EXT and out.mode == "RGBA":
             bg = Image.new("RGB", out.size, (255, 255, 255))
             bg.paste(out, mask=out.split()[3])
@@ -498,12 +628,12 @@ class ImageRedactorApp(tk.Tk):
 
         if isinstance(img, Image.Image):
             img = img.convert("RGBA")
-            if self.image is None:
+            if self.base_image is None:
                 self.new_document_from_image(img, None)
             else:
                 self.push_undo()
-                x = max(0, (self.image.width - img.width) // 2)
-                y = max(0, (self.image.height - img.height) // 2)
+                x = max(0, (self.base_image.width - img.width) // 2)
+                y = max(0, (self.base_image.height - img.height) // 2)
                 ov = Overlay("image", x, y, image=img)
                 self.overlays.append(ov)
                 self.selected_overlay = ov
@@ -527,11 +657,11 @@ class ImageRedactorApp(tk.Tk):
         except Exception:
             text = None
         if text:
-            if self.image is None:
+            if self.base_image is None:
                 messagebox.showinfo("Paste", "Open or create an image first, then paste text onto it.")
                 return
             self.push_undo()
-            ov = Overlay("text", self.image.width // 4, self.image.height // 4,
+            ov = Overlay("text", self.base_image.width // 4, self.base_image.height // 4,
                          text=text, color=self.pen_color)
             self.overlays.append(ov)
             self.selected_overlay = ov
@@ -545,12 +675,13 @@ class ImageRedactorApp(tk.Tk):
     # -------------------------------------------------------------- undo
     def _snapshot(self):
         return {
-            "image": self.image.copy() if self.image is not None else None,
+            "base_image": self.base_image.copy() if self.base_image is not None else None,
+            "annotation_layer": self.annotation_layer.copy() if self.annotation_layer is not None else None,
             "overlays": [o.clone() for o in self.overlays],
         }
 
     def push_undo(self):
-        if self.image is None:
+        if self.base_image is None:
             return
         self.undo_stack.append(self._snapshot())
         if len(self.undo_stack) > MAX_HISTORY:
@@ -560,7 +691,8 @@ class ImageRedactorApp(tk.Tk):
         self.update_title()
 
     def _restore(self, snap):
-        self.image = snap["image"]
+        self.base_image = snap["base_image"]
+        self.annotation_layer = snap["annotation_layer"]
         self.overlays = [o.clone() for o in snap["overlays"]]
         self.selected_overlay = None
         self.redraw()
@@ -584,23 +716,32 @@ class ImageRedactorApp(tk.Tk):
         self.status.set("Redo.")
 
     # ---------------------------------------------------------- overlays
-    def render_composite(self, base=None):
-        img = (base if base is not None else self.image).copy()
-        draw = ImageDraw.Draw(img)
+    def _bake_overlays(self, layer):
+        """Draw all live overlays onto a copy of `layer` (RGBA) and return it."""
+        out = layer.copy()
+        draw = ImageDraw.Draw(out)
         for ov in self.overlays:
             if ov.kind == "text":
                 fnt = get_font(ov.font_family, ov.font_size)
                 draw.text((ov.x, ov.y), ov.text, fill=ov.color, font=fnt)
             elif ov.kind == "image" and ov.image is not None:
-                img.paste(ov.image, (int(ov.x), int(ov.y)), ov.image)
-        return img
+                out.paste(ov.image, (int(ov.x), int(ov.y)), ov.image)
+        return out
+
+    def render_composite(self):
+        if self.base_image is None:
+            return None
+        composite = Image.alpha_composite(self.base_image, self.annotation_layer)
+        if self.overlays:
+            composite = self._bake_overlays(composite)
+        return composite
 
     def commit_overlays(self, push_history=True):
-        if not self.overlays or self.image is None:
+        if not self.overlays or self.base_image is None:
             return
         if push_history:
             self.push_undo()
-        self.image = self.render_composite()
+        self.annotation_layer = self._bake_overlays(self.annotation_layer)
         self.overlays = []
         self.selected_overlay = None
 
@@ -618,7 +759,7 @@ class ImageRedactorApp(tk.Tk):
             self.cancel_crop()
         self.tool.set(name)
         for val, b in self.tool_buttons.items():
-            b.state(["pressed"] if val == name else ["!pressed"])
+            b.configure(style="ToolbarSelected.TButton" if val == name else "Toolbar.TButton")
         self.build_side_panel()
         cursors = {"select": "arrow", "pen": "pencil", "eraser": "dotbox",
                    "text": "xterm", "crop": "crosshair"}
@@ -631,16 +772,18 @@ class ImageRedactorApp(tk.Tk):
         p = self.side_panel
 
         if tool == "select":
-            ttk.Label(p, text="Select / Move", font=("", 11, "bold")).pack(anchor="w")
-            ttk.Label(p, wraplength=220, justify="left",
+            ttk.Label(p, text="Select / Move", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            ttk.Label(p, wraplength=220, justify="left", foreground=COLORS["text_dim"],
                       text="Click a text or pasted-image layer to select and drag it. "
+                           "Drag the small handle at its bottom-right corner to resize it. "
                            "Double-click text to edit it. Press Delete to remove the "
                            "selected layer.").pack(anchor="w", pady=6)
 
         elif tool == "pen":
-            ttk.Label(p, text="Pen", font=("", 11, "bold")).pack(anchor="w")
+            ttk.Label(p, text="Pen", font=("Segoe UI", 11, "bold")).pack(anchor="w")
             ttk.Label(p, text="Color").pack(anchor="w", pady=(10, 2))
-            self.pen_color_btn = tk.Button(p, text="        ", bg=self.pen_color,
+            self.pen_color_btn = tk.Button(p, text="        ", bg=self.pen_color, relief="flat",
+                                            highlightthickness=1, highlightbackground=COLORS["border"],
                                             command=self.pick_pen_color)
             self.pen_color_btn.pack(anchor="w")
             ttk.Label(p, text="Thickness").pack(anchor="w", pady=(10, 2))
@@ -648,25 +791,26 @@ class ImageRedactorApp(tk.Tk):
             ttk.Label(p, textvariable=self.pen_size).pack(anchor="w")
 
         elif tool == "eraser":
-            ttk.Label(p, text="Eraser", font=("", 11, "bold")).pack(anchor="w")
+            ttk.Label(p, text="Eraser", font=("Segoe UI", 11, "bold")).pack(anchor="w")
             ttk.Label(p, text="Thickness").pack(anchor="w", pady=(10, 2))
             ttk.Scale(p, from_=5, to=150, variable=self.eraser_size, orient="horizontal").pack(fill="x")
             ttk.Label(p, textvariable=self.eraser_size).pack(anchor="w")
-            ttk.Label(p, wraplength=220, justify="left",
-                      text="Erases to transparency. Save as PNG/WebP/GIF to keep "
-                           "transparency; JPG/BMP will fill erased areas with white.").pack(anchor="w", pady=10)
+            ttk.Label(p, wraplength=220, justify="left", foreground=COLORS["text_dim"],
+                      text="Only erases pen strokes, text and pasted images you've added. "
+                           "The original photo underneath is never touched.").pack(anchor="w", pady=10)
 
         elif tool == "text":
-            ttk.Label(p, text="Text", font=("", 11, "bold")).pack(anchor="w")
-            ttk.Label(p, wraplength=220, justify="left",
+            ttk.Label(p, text="Text", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            ttk.Label(p, wraplength=220, justify="left", foreground=COLORS["text_dim"],
                       text="Click anywhere on the image to add a text layer. "
-                           "Click existing text to drag it, double-click to edit "
-                           "its content, font, size or color.").pack(anchor="w", pady=6)
+                           "Click existing text to drag it, drag its corner handle "
+                           "to resize, or double-click to edit its content, font, "
+                           "size or color.").pack(anchor="w", pady=6)
             ttk.Button(p, text="Add Text at Center", command=self.add_text_at_center).pack(anchor="w", pady=6)
 
         elif tool == "crop":
-            ttk.Label(p, text="Crop", font=("", 11, "bold")).pack(anchor="w")
-            ttk.Label(p, wraplength=220, justify="left",
+            ttk.Label(p, text="Crop", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            ttk.Label(p, wraplength=220, justify="left", foreground=COLORS["text_dim"],
                       text="Drag a rectangle on the image, then Apply.").pack(anchor="w", pady=6)
             row = ttk.Frame(p)
             row.pack(anchor="w", pady=6)
@@ -680,9 +824,9 @@ class ImageRedactorApp(tk.Tk):
             self.pen_color_btn.configure(bg=hexval)
 
     def add_text_at_center(self):
-        if self.image is None:
+        if self.base_image is None:
             return
-        x, y = self.image.width // 2 - 60, self.image.height // 2 - 20
+        x, y = self.base_image.width // 2 - 60, self.base_image.height // 2 - 20
         self._open_text_dialog(x, y)
 
     def _open_text_dialog(self, x, y, overlay=None):
@@ -711,19 +855,24 @@ class ImageRedactorApp(tk.Tk):
 
     # ------------------------------------------------------------ image ops
     def _require_image(self):
-        if self.image is None:
+        if self.base_image is None:
             messagebox.showinfo(APP_TITLE, "Open or create an image first.")
             return False
         return True
+
+    def _bake_overlays_into_annotation(self):
+        if self.overlays:
+            self.annotation_layer = self._bake_overlays(self.annotation_layer)
+            self.overlays = []
+            self.selected_overlay = None
 
     def flip_horizontal(self):
         if not self._require_image():
             return
         self.push_undo()
-        if self.overlays:
-            self.image = self.render_composite()
-            self.overlays = []
-        self.image = self.image.transpose(Image.FLIP_LEFT_RIGHT)
+        self._bake_overlays_into_annotation()
+        self.base_image = self.base_image.transpose(Image.FLIP_LEFT_RIGHT)
+        self.annotation_layer = self.annotation_layer.transpose(Image.FLIP_LEFT_RIGHT)
         self.fit_to_window()
         self.redraw()
 
@@ -731,10 +880,9 @@ class ImageRedactorApp(tk.Tk):
         if not self._require_image():
             return
         self.push_undo()
-        if self.overlays:
-            self.image = self.render_composite()
-            self.overlays = []
-        self.image = self.image.transpose(Image.FLIP_TOP_BOTTOM)
+        self._bake_overlays_into_annotation()
+        self.base_image = self.base_image.transpose(Image.FLIP_TOP_BOTTOM)
+        self.annotation_layer = self.annotation_layer.transpose(Image.FLIP_TOP_BOTTOM)
         self.fit_to_window()
         self.redraw()
 
@@ -742,10 +890,9 @@ class ImageRedactorApp(tk.Tk):
         if not self._require_image():
             return
         self.push_undo()
-        if self.overlays:
-            self.image = self.render_composite()
-            self.overlays = []
-        self.image = self.image.transpose(Image.ROTATE_90)
+        self._bake_overlays_into_annotation()
+        self.base_image = self.base_image.transpose(Image.ROTATE_90)
+        self.annotation_layer = self.annotation_layer.transpose(Image.ROTATE_90)
         self.fit_to_window()
         self.redraw()
 
@@ -753,10 +900,9 @@ class ImageRedactorApp(tk.Tk):
         if not self._require_image():
             return
         self.push_undo()
-        if self.overlays:
-            self.image = self.render_composite()
-            self.overlays = []
-        self.image = self.image.transpose(Image.ROTATE_270)
+        self._bake_overlays_into_annotation()
+        self.base_image = self.base_image.transpose(Image.ROTATE_270)
+        self.annotation_layer = self.annotation_layer.transpose(Image.ROTATE_270)
         self.fit_to_window()
         self.redraw()
 
@@ -768,15 +914,14 @@ class ImageRedactorApp(tk.Tk):
         x0, x1 = sorted((x0, x1))
         y0, y1 = sorted((y0, y1))
         x0, y0 = max(0, int(x0)), max(0, int(y0))
-        x1, y1 = min(self.image.width, int(x1)), min(self.image.height, int(y1))
+        x1, y1 = min(self.base_image.width, int(x1)), min(self.base_image.height, int(y1))
         if x1 - x0 < 2 or y1 - y0 < 2:
             messagebox.showinfo("Crop", "Selection is too small.")
             return
         self.push_undo()
-        if self.overlays:
-            self.image = self.render_composite()
-            self.overlays = []
-        self.image = self.image.crop((x0, y0, x1, y1))
+        self._bake_overlays_into_annotation()
+        self.base_image = self.base_image.crop((x0, y0, x1, y1))
+        self.annotation_layer = self.annotation_layer.crop((x0, y0, x1, y1))
         self.cancel_crop()
         self.set_tool("select")
         self.fit_to_window()
@@ -793,11 +938,11 @@ class ImageRedactorApp(tk.Tk):
     def open_adjust_panel(self):
         if not self._require_image():
             return
-        if self.overlays:
-            self.commit_overlays(push_history=True)
-        self._adjust_base = self.image.copy()
+        self.commit_overlays(push_history=True)
+        self._adjust_base = self.base_image.copy()
 
         win = tk.Toplevel(self)
+        win.configure(bg=COLORS["panel"])
         win.title("Adjustments")
         win.resizable(False, False)
         win.transient(self)
@@ -819,18 +964,21 @@ class ImageRedactorApp(tk.Tk):
             "blur": (0.0, 20.0),
         }
 
+        frm = ttk.Frame(win, padding=12)
+        frm.pack()
+
         def preview(*_):
             kwargs = {k: v.get() for k, v in vars_.items()}
-            self.image = apply_adjustments(self._adjust_base, **kwargs)
+            self.base_image = apply_adjustments(self._adjust_base, **kwargs)
             self.redraw()
 
         row = 0
         for key, label in (("brightness", "Brightness"), ("contrast", "Contrast"),
                             ("saturation", "Saturation"), ("hue", "Hue"),
                             ("sharpness", "Sharpness"), ("blur", "Blur")):
-            ttk.Label(win, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=4)
+            ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=4)
             lo, hi = ranges[key]
-            s = ttk.Scale(win, from_=lo, to=hi, variable=vars_[key], orient="horizontal",
+            s = ttk.Scale(frm, from_=lo, to=hi, variable=vars_[key], orient="horizontal",
                           length=220, command=preview)
             s.grid(row=row, column=1, padx=8, pady=4)
             row += 1
@@ -842,20 +990,21 @@ class ImageRedactorApp(tk.Tk):
 
         def do_apply():
             self.push_undo()
-            # push_undo snapshots current (already-adjusted) image as if it
-            # were the prior state, which is wrong -- fix by re-baselining:
-            # replace the just-pushed snapshot's image with the pre-adjust one.
-            self.undo_stack[-1]["image"] = self._adjust_base.copy()
+            # push_undo snapshots the current (already-adjusted) base image as
+            # if it were the prior state, which is wrong -- fix by
+            # re-baselining: replace the just-pushed snapshot's base image
+            # with the pre-adjustment one.
+            self.undo_stack[-1]["base_image"] = self._adjust_base.copy()
             self.dirty = True
             self.update_title()
             win.destroy()
 
         def do_cancel():
-            self.image = self._adjust_base
+            self.base_image = self._adjust_base
             self.redraw()
             win.destroy()
 
-        btns = ttk.Frame(win)
+        btns = ttk.Frame(frm)
         btns.grid(row=row, column=0, columnspan=2, pady=10)
         ttk.Button(btns, text="Reset", command=do_reset).pack(side="left", padx=4)
         ttk.Button(btns, text="Cancel", command=do_cancel).pack(side="left", padx=4)
@@ -865,12 +1014,12 @@ class ImageRedactorApp(tk.Tk):
 
     # ------------------------------------------------------------- canvas
     def fit_to_window(self):
-        if self.image is None:
+        if self.base_image is None:
             return
         self.update_idletasks()
         cw = max(self.canvas.winfo_width(), 10)
         ch = max(self.canvas.winfo_height(), 10)
-        iw, ih = self.image.size
+        iw, ih = self.base_image.size
         self.scale = max(0.01, min(cw / iw, ch / ih, 1.0)) if (iw > cw or ih > ch) else min(cw / iw, ch / ih)
         self.scale = min(self.scale, 4.0)
         disp_w, disp_h = iw * self.scale, ih * self.scale
@@ -884,7 +1033,7 @@ class ImageRedactorApp(tk.Tk):
 
     def _on_resize_settled(self):
         self._resize_job = None
-        if self.image is not None:
+        if self.base_image is not None:
             self.fit_to_window()
             self.redraw()
 
@@ -896,45 +1045,56 @@ class ImageRedactorApp(tk.Tk):
 
     def redraw(self):
         self.canvas.delete("all")
-        if self.image is None:
-            self.canvas.create_text(20, 20, anchor="nw", fill="#bbbbbb",
+        if self.base_image is None:
+            self.canvas.create_text(20, 20, anchor="nw", fill=COLORS["text_dim"],
                                      text="No image open. File > Open, or Ctrl+V to paste.")
+            self._handle_canvas_rect = None
             return
-        composite = self.render_composite() if self.overlays else self.image
+        composite = self.render_composite()
         iw, ih = composite.size
         disp_w, disp_h = max(1, round(iw * self.scale)), max(1, round(ih * self.scale))
         resample = Image.NEAREST if self.scale >= 1 else Image.BOX
         disp = composite.resize((disp_w, disp_h), resample)
         self.tk_photo = ImageTk.PhotoImage(disp)
         self.canvas.create_image(self.off_x, self.off_y, anchor="nw", image=self.tk_photo)
-        # subtle border around the canvas so users see the image edges
         self.canvas.create_rectangle(self.off_x, self.off_y, self.off_x + disp_w, self.off_y + disp_h,
-                                      outline="#555555")
+                                      outline=COLORS["border"])
+        self._handle_canvas_rect = None
         if self.selected_overlay is not None and self.selected_overlay in self.overlays:
             l, t, r, b = self.selected_overlay.bbox()
             cl, ct = self.img_to_canvas(l, t)
             cr, cb = self.img_to_canvas(r, b)
-            self.canvas.create_rectangle(cl, ct, cr, cb, outline="#00aaff", width=2, dash=(4, 2))
+            self.canvas.create_rectangle(cl, ct, cr, cb, outline=COLORS["accent"], width=2, dash=(4, 2))
+            hs = 6
+            self.canvas.create_rectangle(cr - hs, cb - hs, cr + hs, cb + hs,
+                                          fill=COLORS["accent"], outline="white")
+            self._handle_canvas_rect = (cr - hs - 3, cb - hs - 3, cr + hs + 3, cb + hs + 3)
         self.status.set(self._status_text())
 
     def _status_text(self):
-        if self.image is None:
+        if self.base_image is None:
             return "No image open."
-        w, h = self.image.size
+        w, h = self.base_image.size
         name = os.path.basename(self.current_path) if self.current_path else "Untitled"
         return f"{name}  |  {w} x {h} px  |  tool: {self.tool.get()}  |  zoom: {round(self.scale * 100)}%"
 
     # ------------------------------------------------------- mouse events
     def on_canvas_motion(self, event):
-        if self.image is None:
+        if self.base_image is None:
             return
         ix, iy = self.canvas_to_img(event.x, event.y)
-        w, h = self.image.size
+        w, h = self.base_image.size
         if 0 <= ix < w and 0 <= iy < h:
             self.status.set(self._status_text() + f"  |  x:{int(ix)} y:{int(iy)}")
 
+    def _point_in_handle(self, cx, cy):
+        if not self._handle_canvas_rect:
+            return False
+        x0, y0, x1, y1 = self._handle_canvas_rect
+        return x0 <= cx <= x1 and y0 <= cy <= y1
+
     def on_canvas_press(self, event):
-        if self.image is None:
+        if self.base_image is None:
             return
         tool = self.tool.get()
         ix, iy = self.canvas_to_img(event.x, event.y)
@@ -947,19 +1107,23 @@ class ImageRedactorApp(tk.Tk):
             self.redraw()
             return
 
-        if tool == "text":
-            hit = self._hit_test(ix, iy)
-            if hit is not None:
-                self.selected_overlay = hit
-                self._drag_overlay = hit
-                self._drag_offset = (ix - hit.x, iy - hit.y)
-                self.redraw()
-            else:
-                self._open_text_dialog(ix, iy)
-            return
+        if tool in ("select", "text"):
+            if self.selected_overlay is not None and self._point_in_handle(event.x, event.y):
+                ov = self.selected_overlay
+                l, t, r, b = ov.bbox()
+                self._resizing_overlay = ov
+                self._resize_orig = {
+                    "font_size": ov.font_size,
+                    "w": max(1.0, r - l),
+                    "h": max(1.0, b - t),
+                    "img": ov.image.copy() if ov.kind == "image" and ov.image is not None else None,
+                }
+                return
 
-        if tool == "select":
             hit = self._hit_test(ix, iy)
+            if tool == "text" and hit is None:
+                self._open_text_dialog(ix, iy)
+                return
             self.selected_overlay = hit
             if hit is not None:
                 self._drag_overlay = hit
@@ -973,17 +1137,33 @@ class ImageRedactorApp(tk.Tk):
             return
 
     def on_canvas_drag(self, event):
-        if self.image is None:
+        if self.base_image is None:
             return
         tool = self.tool.get()
         ix, iy = self.canvas_to_img(event.x, event.y)
-        w, h = self.image.size
+        w, h = self.base_image.size
         ix = max(0, min(w, ix))
         iy = max(0, min(h, iy))
 
         if tool in ("pen", "eraser") and self._drawing:
             self._draw_line(self._last_point, (ix, iy))
             self._last_point = (ix, iy)
+            self.redraw()
+            return
+
+        if self._resizing_overlay is not None:
+            ov = self._resizing_overlay
+            orig = self._resize_orig
+            new_w = max(8.0, ix - ov.x)
+            new_h = max(8.0, iy - ov.y)
+            if ov.kind == "text":
+                scale = new_h / orig["h"]
+                ov.font_size = max(6, min(400, round(orig["font_size"] * scale)))
+            elif ov.kind == "image" and orig["img"] is not None:
+                scale = new_w / orig["w"]
+                nw = max(4, round(orig["img"].width * scale))
+                nh = max(4, round(orig["img"].height * scale))
+                ov.image = orig["img"].resize((nw, nh), Image.LANCZOS)
             self.redraw()
             return
 
@@ -1004,6 +1184,8 @@ class ImageRedactorApp(tk.Tk):
         if tool in ("pen", "eraser"):
             self._drawing = False
             self._last_point = None
+        self._resizing_overlay = None
+        self._resize_orig = None
         if tool in ("select", "text"):
             self._drag_overlay = None
             self._drag_offset = None
@@ -1011,7 +1193,7 @@ class ImageRedactorApp(tk.Tk):
             self._crop_start = None
 
     def on_canvas_double_click(self, event):
-        if self.image is None or self.tool.get() not in ("text", "select"):
+        if self.base_image is None or self.tool.get() not in ("text", "select"):
             return
         ix, iy = self.canvas_to_img(event.x, event.y)
         hit = self._hit_test(ix, iy)
@@ -1039,14 +1221,14 @@ class ImageRedactorApp(tk.Tk):
         tool = self.tool.get()
         size = self.pen_size.get() if tool == "pen" else self.eraser_size.get()
         r = size / 2
-        draw = ImageDraw.Draw(self.image)
+        draw = ImageDraw.Draw(self.annotation_layer)
         fill = self._rgba_fill(tool)
         draw.ellipse((ix - r, iy - r, ix + r, iy + r), fill=fill)
 
     def _draw_line(self, p0, p1):
         tool = self.tool.get()
         size = self.pen_size.get() if tool == "pen" else self.eraser_size.get()
-        draw = ImageDraw.Draw(self.image)
+        draw = ImageDraw.Draw(self.annotation_layer)
         fill = self._rgba_fill(tool)
         draw.line([p0, p1], fill=fill, width=max(1, int(size)))
         self._draw_dot(*p1)
